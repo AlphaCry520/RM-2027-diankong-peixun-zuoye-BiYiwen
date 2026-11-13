@@ -1,0 +1,374 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "dma.h"
+#include "usart.h"
+#include "gpio.h"
+#include <stdio.h>
+#include <string.h>
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include "OLED.h"
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+typedef struct __attribute__((packed))//6字节 1包头位 1切灯控制位 1方向位 2延时位 1校验和
+{
+  uint8_t rx_header;
+  uint8_t rx_run_cmd;
+  uint8_t rx_dir;
+  uint16_t rx_interval_ms;
+  uint8_t rx_check_sum;
+} ReceivePacket_t;
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+
+/* USER CODE BEGIN PV */
+//LED流水灯相关变量定义
+int8_t led_chaser_status = 0;//流水灯状态机标志位置
+uint32_t led_last_tick = 0;//流水灯最新时间戳
+uint16_t run_interval_ms = 300;//切灯时间
+uint8_t run_cmd = 1;//切灯允许控制
+//按键相关变量定义
+uint8_t key1_num = 0;//切换流水灯方向 0正向 1反向
+uint8_t key2_num = 1;//控制流水灯是否切灯 0不切 1切
+
+volatile uint8_t key1_trigger = 0;//按键1触发检测
+volatile uint8_t key2_trigger = 0;//按键2触发检测
+
+volatile uint32_t key1_tri_tick = 0;//按键1触发时间戳
+volatile uint32_t key2_tri_tick = 0;//按键1触发时间戳
+//串口相关变量定义
+ReceivePacket_t receive_packet;//创建一个接收数据缓冲区
+volatile uint8_t rx_ready = 0;//接收完成标志位
+uint8_t tx_packet[80];//反馈发送缓冲区
+volatile uint8_t tx_ready = 0;//可以发送标志位
+//OLED相关变量定义
+uint32_t oled_last_tick = 0; //OLED刷新时间戳
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+/* USER CODE BEGIN PFP */
+void Build_FeedBack_String(void);//拼接发送反馈字符串存到tx_packet中
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_USART1_UART_Init();
+  /* USER CODE BEGIN 2 */
+  led_last_tick = HAL_GetTick();//流水灯获取初始时间戳
+  oled_last_tick = HAL_GetTick();//OLED获取初始化时间戳
+
+  OLED_Init();//OLED显示初始化
+
+  __HAL_UART_CLEAR_OREFLAG(&huart1);//清理溢出防串口失控
+  HAL_UART_Receive_IT(&huart1, (uint8_t*)&receive_packet,sizeof(receive_packet));//上膛
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    //OLED部分
+    if (HAL_GetTick() - oled_last_tick >= 100)//100ms刷新一次
+    {
+      oled_last_tick = HAL_GetTick();//更新时间戳
+
+      char temp_buffer[17];//拼装存储地址
+
+      if (key2_num)//1表切灯
+        snprintf(temp_buffer,sizeof(temp_buffer),"STATE:RUN       ");
+      else
+        snprintf(temp_buffer,sizeof(temp_buffer),"STATE:STOP      ");
+      OLED_ShowString(1,1, temp_buffer);
+
+      if (key1_num)//1表反向
+        snprintf(temp_buffer,sizeof(temp_buffer),"DIR:REV         ");
+      else
+        snprintf(temp_buffer,sizeof(temp_buffer),"DIR:FWD         ");
+      OLED_ShowString(2,1, temp_buffer);
+
+      snprintf(temp_buffer,sizeof(temp_buffer),"STEP:%04ums     ", run_interval_ms);//打印切灯时间
+      OLED_ShowString(3,1, temp_buffer);
+
+      snprintf(temp_buffer,sizeof(temp_buffer),"LED:%u          ", led_chaser_status);//打印亮的LED编号
+      OLED_ShowString(4,1, temp_buffer);
+
+    }
+    //流水灯部分
+    if (HAL_GetTick() - led_last_tick >= run_interval_ms)//轮询判断切灯时间到没到
+    {
+      led_last_tick = HAL_GetTick();//更新时间戳
+
+      if (key2_num  == 1)//切灯使能判断
+      {
+        //先全部熄灭
+        HAL_GPIO_WritePin(LED0_GPIO_Port, LED0_Pin, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_SET);
+
+        switch (led_chaser_status)//状态机选择亮的灯
+        {
+        case 0:
+          HAL_GPIO_WritePin(LED0_GPIO_Port, LED0_Pin, GPIO_PIN_RESET);
+          break;
+        case 1:
+          HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_RESET);
+          break;
+        case 2:
+          HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_RESET);
+          break;
+        default:
+          led_chaser_status = 0;//状态修正
+          break;
+        }
+
+        //状态迁移 1反向 0正向
+        if (key1_num)
+          led_chaser_status--;
+        else
+          led_chaser_status++;
+
+        //状态修正
+        if (led_chaser_status == 3)
+          led_chaser_status = 0;
+        if (led_chaser_status == -1)
+          led_chaser_status = 2;
+      }
+    }
+
+    //按键修改流水灯状态部分
+    if (key1_trigger && HAL_GetTick() - key1_tri_tick >= 20)//KEY1 切方向发生与否判断 + 延时消抖
+    {
+      if (HAL_GPIO_ReadPin(KEY1_GPIO_Port, KEY1_Pin) == GPIO_PIN_SET)//判断是否为震荡
+      {
+        while (HAL_GPIO_ReadPin(KEY1_GPIO_Port, KEY1_Pin) == GPIO_PIN_SET);//松手检测
+        key1_num = !key1_num;//切灯方向取反
+        tx_ready = 1;//打上发送标记
+      }
+      key1_trigger = 0;//无论是否为震荡 都消费
+    }
+
+    if (key2_trigger && HAL_GetTick() - key2_tri_tick >= 20)//KEY1 切灯使能判断 + 延时消抖
+    {
+      if (HAL_GPIO_ReadPin(KEY2_GPIO_Port, KEY2_Pin) == GPIO_PIN_SET)//判断是否为震荡
+      {
+        while (HAL_GPIO_ReadPin(KEY2_GPIO_Port, KEY2_Pin) == GPIO_PIN_SET);//松手检测
+        key2_num = !key2_num;//切灯使能取反
+        tx_ready = 1;//打上发送标记
+      }
+      key2_trigger = 0;//无论是否为震荡 都消费
+    }
+
+    //串口数据控制流水灯部分
+    if (rx_ready)//发送完毕判断
+    {
+      rx_ready = 0;//消费
+      ReceivePacket_t temp_packet = receive_packet;//拷贝防覆盖
+      uint8_t *prx_packet = (uint8_t*)&temp_packet;
+      uint8_t temp_sum = prx_packet[0] + prx_packet[1] + prx_packet[2] + prx_packet[3] + prx_packet[4];//实际校验和 高位截断
+      if (temp_packet.rx_header == 0xAA //包头建议
+        && temp_packet.rx_check_sum == temp_sum//校验和检验
+        && temp_packet.rx_dir <= 1//防呆
+        && temp_packet.rx_run_cmd <= 1//防呆
+        && temp_packet.rx_interval_ms >= 100//时间合规检定
+        && temp_packet.rx_interval_ms <= 2000)
+      {
+        //流水灯状态参数修改
+        key1_num = temp_packet.rx_dir;//key控方向
+        key2_num = temp_packet.rx_run_cmd;//key控切灯使能
+        run_interval_ms = temp_packet.rx_interval_ms;//改切灯时间
+
+        tx_ready = 1;//打上发送标记
+      }
+      //异常数据包直接丢弃
+      __HAL_UART_CLEAR_OREFLAG(&huart1);//清理溢出防串口失控
+      HAL_UART_Receive_IT(&huart1, (uint8_t*)&receive_packet,sizeof(receive_packet));//重上膛
+    }
+
+    //串口发送反馈
+    if (tx_ready)//判断状态是否更新
+    {
+      if (huart1.gState == HAL_UART_STATE_READY)//判断uart1句柄是否空闲 防串口占用发送失败
+      {
+        Build_FeedBack_String();//把数据拼到tx_packet中
+        HAL_UART_Transmit_DMA(&huart1, (uint8_t*)tx_packet,strlen((const char*)tx_packet));
+        tx_ready = 0;//消费
+      }
+    }
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/* USER CODE BEGIN 4 */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)//按键中断处理
+{
+  if (GPIO_Pin == KEY1_Pin)//判断中断源
+  {
+    key1_trigger = 1;//打标记
+    key1_tri_tick = HAL_GetTick();//记录时间
+  }
+
+  if (GPIO_Pin == KEY2_Pin)//判断中断源
+  {
+    key2_trigger = 1;//打标记
+    key2_tri_tick = HAL_GetTick();//记录时间
+  }
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)//接收完毕处理
+{
+  if (huart->Instance == USART1)//判断外设基地址
+  {
+    rx_ready = 1;//打标记
+  }
+}
+
+void Build_FeedBack_String(void)//拼接发送反馈字符串存到tx_packet中
+{
+    snprintf(tx_packet, sizeof(tx_packet),"STATE=%s,DIR=%s,STEP=%ums,LED=%u\r\n",
+      key2_num? "RUN" : "STOP", key1_num? "REV" : "FWD", run_interval_ms, led_chaser_status);
+}
+
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART1);//读一下基地址 无需手动操作
+}
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
